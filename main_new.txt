@@ -1,99 +1,3 @@
-//! BORUIX `audiod`：用户态音频混音守护进程（plan_audio_vfs.md 批次四）。
-//!
-//! **职责（M1 阶段）**：把混音器输入端 `/devices/audio/stream/0` 的 PCM
-//! **原样转发**到输出端 `/devices/audio/dsp`。此阶段**不含任何混音算法**——
-//! 目的是在引入算法之前，先证明多路输入 -> 中间层 -> dsp 这条链路本身是通的。
-//! 若此时输出与直写 dsp 不同，那一定是链路错误而非算法错误，故障定位被简化。
-//!
-//! **为何要用户态中间层**（而不是内核里混音）：内核的音频节点是**哑管道**——
-//! 对 PCM 零知识，只搬字节。混音是策略而非机制，放用户态才能在不改内核的
-//! 前提下迭代算法（M2 混音、M3 欠载、M4 音量都在本进程内完成）。
-//!
-//! **独占消费者的顺序约束（重要）**：`dsp` 是独占消费者语义，消费者必须
-//! `attach()`。本进程启动即 attach 且**永不 detach**（守护进程）。故任何其它
-//! 需要 attach 的东西都必须在本进程之前运行——与 intel-hda 对 A2 造成的约束
-//! 同源。init 的启动顺序已按此约定排列。
-//!
-//! **失败模式（S20，先定义再写正常路径）**：
-//! - `attach` 失败（已被别的消费者占用）-> 如实报错并**退出**；
-//! - `stream/0` / `dsp` 打不开 -> 如实报错并退出；
-//! - `stream/0` 暂时无数据（EAGAIN）-> 本轮**跳过**，不是错误；
-//! - `dsp` ring 满（EAGAIN）-> 让出 CPU 后**重试同一段数据**，绝不丢弃；
-//! - 非 EAGAIN 的硬错误 -> 如实报错并退出（不静默消失）。
-//!
-//! 所有失败路径都返回非 0，使 init 的 waitpid 能如实观察到"混音器挂了"。
-
-#![no_std]
-#![no_main]
-extern crate alloc;
-
-use libsys::*;
-
-/// 混音器输入端**目录**。各路为 `<STREAM_DIR>/<下标>`。
-///
-/// 内核挂 `stream/0..AUDIO_STREAM_COUNT-1`（见 vfs::AUDIO_STREAM_COUNT）。
-/// 这里只写目录前缀，具体路径在启动时按下标拼出——避免硬编码字符串表（S13）。
-const STREAM_DIR: &str = "/devices/audio/stream";
-
-/// 输出端路径（哑管道：数据写入即被 intel-hda 取走喂 DMA）。
-const DSP_PATH: &str = "/devices/audio/dsp";
-
-/// 混音器参与混音的路数。
-///
-/// **必须与内核 `vfs::AUDIO_STREAM_COUNT` 一致**（4）。本进程打开 0..N-1；
-/// 内核没挂的路会被 `NotFound` 跳过并如实记录，故即使两者暂时不一致也不会
-/// 崩，只会减少实际混音路数——这是有意的容错（S20），不是掩盖配置错误。
-const MIX_INPUTS: usize = 4;
-
-/// 每轮从**每一路**读取的最大字节数。
-///
-/// **必须帧对齐**（`FRAME_BYTES` 的整数倍），否则读到半帧会与下一轮拼接错位，
-/// 使左右声道互换。4096 = 1024 帧（约 21ms @48kHz）。
-/// 与 `dsp` 的 64 KiB ring 相比足够小，使单次写通常放得下（背压罕见）。
-const MIX_READ_BYTES: usize = 4096;
-
-/// 一个 PCM 帧的字节数（s16 立体声：2 声道 x 2 字节）。
-///
-/// 该值是**格式契约**的一部分，与 dsp 属性文件报告的 format 对应；
-/// M4/批次五若要支持其它格式，必须让本常量与格式同步变化，而非各处硬编码。
-const FRAME_BYTES: usize = 4;
-
-/// 每帧的声道数（与 `FRAME_BYTES` 一致，用于 f32 缓冲的容量估算）。
-const FORMAT_CHANNELS: usize = 2;
-
-/// 每多少轮打印一次进度。
-///
-/// **取值理由**：轮询一轮通常只搬 4096 字节，若每轮都打印会在数十秒内刷出
-/// 数万行日志，把真正有价值的证据淹没。64 轮约 256 KiB 数据，既能证明
-/// "在持续推进"，又不至于刷屏。
-const PROGRESS_EVERY: u64 = 64;
-
-/// 一路已打开的输入流。
-///
-/// `path` 保留是为了错误信息能指名道姓（编号 + 路径），而不是只报下标——
-/// 排查时"哪一路"与"哪个文件"是两个都要立刻知道的信息。
-struct Input {
-    fd: u64,
-    path: alloc::string::String,
-}
-
-/// 向 STDOUT 输出一行日志（`[audiod] ...`）。
-fn log(msg: &[u8]) {
-    let _ = write(STDOUT, b"[audiod] ");
-    let _ = write(STDOUT, msg);
-    let _ = write(STDOUT, b"\n");
-}
-
-/// 带格式的日志（alloc::format 动态拼接，可含数字/错误）。
-fn logf(args: core::fmt::Arguments) {
-    let s = alloc::format!("{}", args);
-    log(s.as_bytes());
-}
-
-/// audiod 主流程：attach dsp -> 循环转发 stream/0。
-///
-/// 这是**守护进程**，正常情况下永不返回。
-#[unsafe(no_mangle)]
 pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
     log(b"audiod starting (batch-4 M2: N-stream f32 mix -> dsp)");
 
@@ -195,7 +99,7 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
                     Ok(_) => {}
                     Err(e) if e == Error::WouldBlock => {}
                     Err(e) => {
-                        logf(format_args!("FAIL: read {} hard error: {:?}", inp.path, e));
+                        logf(format_args!("FAIL: read input {} hard error: {:?}", k, e));
                         return 1;
                     }
                 }

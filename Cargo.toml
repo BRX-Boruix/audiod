@@ -7,6 +7,16 @@ build = "build.rs"
 [dependencies]
 libsys = { path = "../libsys" }
 
+# 纯 DSP 逻辑单独成库（见 src/lib.rs 顶部说明），使格式转换/相加/钳位
+# 这类纯函数能在**宿主**上穷举验证，无需 QEMU 与真实设备。
+[lib]
+name = "audiod"
+path = "src/lib.rs"
+
+[[bin]]
+name = "audiod"
+path = "src/main.rs"
+
 # 用户态裸机程序：无 unwinding 运行时，panic 直接 abort。
 [profile.dev]
 panic = "abort"
