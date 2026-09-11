@@ -1,0 +1,16 @@
+[package]
+name = "audiod"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+
+[dependencies]
+libsys = { path = "../libsys" }
+
+# 用户态裸机程序：无 unwinding 运行时，panic 直接 abort。
+[profile.dev]
+panic = "abort"
+[profile.release]
+panic = "abort"
+opt-level = "z"
+lto = true
