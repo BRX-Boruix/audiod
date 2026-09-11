@@ -1,0 +1,99 @@
+
+    /// M3: a PERMANENTLY disconnected path must be removed from the mix set and
+    /// must NOT be counted as underrunning.
+    ///
+    /// The distinction is the whole point of M3. A path that has gone away is not
+    /// starved; nobody is trying to feed it. Counting it would inflate the underrun
+    /// figure with a condition the mixer cannot fix, drowning out the real signal:
+    /// intermittent starvation of a path that IS still connected.
+    #[test]
+    fn test_m3_permanent_disconnect_is_not_an_underrun() {
+        let mut m = MixerState::new(4);
+        m.set_connected(0, true);
+        m.set_connected(1, true);
+
+        // Path 0 starves while connected -> that IS an underrun.
+        m.note_starved(0);
+        assert_eq!(m.stats(0).underruns, 1);
+
+        // Path 0 disconnects: it leaves the mix set...
+        m.set_connected(0, false);
+        assert!(!m.is_connected(0));
+        // ...and further starvation must not be recorded.
+        m.note_starved(0);
+        assert_eq!(
+            m.stats(0).underruns,
+            1,
+            "a disconnected path must not accrue underruns"
+        );
+
+        // A path never connected likewise never underruns.
+        m.note_starved(2);
+        m.note_starved(2);
+        assert_eq!(
+            m.stats(2).underruns,
+            0,
+            "a never-connected path must not accrue underruns"
+        );
+    }
+
+    /// M3: mix gain must be FIXED at 1/N, independent of how many paths happen to
+    /// have data in a given round.
+    ///
+    /// This was wrong in the first M2 implementation: gain was 1/<paths live right
+    /// now>, so one path briefly lacking data changed the gain for every other path.
+    /// Producer jitter is constant in a real system, so that produced continuous
+    /// audible level jumps -- and a level jump is a click.
+    ///
+    /// The two questions are orthogonal and must stay separate:
+    ///   - how loud is the mix? fixed 1/N, decided once;
+    ///   - what if a path has no data this instant? it contributes silence.
+    #[test]
+    fn test_m3_gain_is_fixed_by_path_count_not_by_liveness() {
+        assert_eq!(
+            mix_gain(4),
+            0.25,
+            "gain must come from configured path count"
+        );
+
+        // One live path among four is still scaled by 1/4, NOT 1/1.
+        let a = alloc::vec![1.0f32, 1.0];
+        let silent: alloc::vec::Vec<f32> = alloc::vec![0.0f32, 0.0];
+        let two_of_four = mix_add(&[&a, &silent, &silent, &silent]);
+        assert!(
+            (two_of_four[0] - 0.25).abs() < 1e-6,
+            "full-scale input must be scaled by 1/4, got {}", two_of_four[0]
+        );
+
+        // Stability property: the surviving path's level must be IDENTICAL whether
+        // the other paths are silent or absent from the call entirely. That is what
+        // makes a path dropping out inaudible as a level change.
+        let only_a = mix_add(&[&a]);
+        assert!(
+            (two_of_four[0] - only_a[0] * 4.0).abs() < 1e-6,
+            "level must not depend on which other paths are present"
+        );
+    }
+
+    /// M3: a starved path contributes silence WITHOUT blocking or shortening others.
+    #[test]
+    fn test_m3_starved_path_is_silence_not_a_stall() {
+        let a = alloc::vec![0.5f32, 0.25, 0.125];
+        let empty: alloc::vec::Vec<f32> = alloc::vec::Vec::new();
+
+        let with_empty = mix_add(&[&a, &empty]);
+        let alone = mix_add(&[&a]);
+        assert_eq!(
+            with_empty.len(),
+            a.len(),
+            "a starved path must not truncate the live one"
+        );
+        let mut i = 0usize;
+        while i < with_empty.len() {
+            assert!(
+                (with_empty[i] - alone[i]).abs() < 1e-6,
+                "starved path must add pure silence, sample {i}"
+            );
+            i += 1;
+        }
+    }

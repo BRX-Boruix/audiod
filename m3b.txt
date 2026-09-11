@@ -1,0 +1,93 @@
+
+    /// M3: a single empty round is NOT an underrun; sustained absence is.
+    ///
+    /// The first implementation counted every round in which a path had no data,
+    /// which made the number grow without bound on a healthy system. Measured on
+    /// QEMU: 47 underruns within 64 rounds, 5871 by round 6016, while BOTH producers
+    /// were alive and actively writing. A counter that always rises carries no
+    /// information -- it cannot distinguish a real fault from ordinary jitter.
+    ///
+    /// Why single-round emptiness is normal here: the mixer is a polling loop, not
+    /// an audio clock. It iterates far faster than producers fill buffers, so most
+    /// rounds legitimately find a given path empty. That is idle spinning, not
+    /// starvation.
+    ///
+    /// Real starvation is SUSTAINED absence -- evidence that a path which was
+    /// supplying data has stopped. Requiring a run of consecutive empty rounds
+    /// before counting gives the counter its meaning back.
+    #[test]
+    fn test_m3_isolated_empty_rounds_are_not_underruns() {
+        let mut m = MixerState::new(2);
+        // Established connection: this path HAS been supplying data.
+        m.set_connected(0, true);
+        m.note_data(0);
+        assert_eq!(m.stats(0).underruns, 0);
+
+        // Occasional empty rounds, each followed by data again. A healthy but
+        // jittery producer looks exactly like this and must stay at zero.
+        let mut i = 0;
+        while i < 20 {
+            m.note_starved(0);
+            m.note_data(0);
+            i += 1;
+        }
+        assert_eq!(
+            m.stats(0).underruns,
+            0,
+            "isolated empty rounds must not accumulate underruns"
+        );
+    }
+
+    /// M3: SUSTAINED absence does count, and counts once per starvation episode.
+    #[test]
+    fn test_m3_sustained_absence_counts_once_per_episode() {
+        let mut m = MixerState::new(2);
+        m.set_connected(0, true);
+        m.note_data(0);
+
+        // A long run of empty rounds is one starvation episode, not one per round.
+        let mut i = 0;
+        while i < 100 {
+            m.note_starved(0);
+            i += 1;
+        }
+        assert_eq!(
+            m.stats(0).underruns,
+            1,
+            "a sustained gap counts once, not once per round"
+        );
+
+        // Data returns, then the path starves again: a second episode.
+        m.note_data(0);
+        let mut j = 0;
+        while j < 100 {
+            m.note_starved(0);
+            j += 1;
+        }
+        assert_eq!(
+            m.stats(0).underruns,
+            2,
+            "a second starvation episode counts separately"
+        );
+    }
+
+    /// M3: a path must have supplied data before its absence can mean starvation.
+    ///
+    /// Startup is the clearest case: nothing has been written yet, so every path is
+    /// empty, and counting that would report a fault before any audio ever played.
+    #[test]
+    fn test_m3_starvation_requires_prior_data() {
+        let mut m = MixerState::new(2);
+        m.set_connected(0, true);
+        // Connected, but has never delivered anything.
+        let mut i = 0;
+        while i < 500 {
+            m.note_starved(0);
+            i += 1;
+        }
+        assert_eq!(
+            m.stats(0).underruns,
+            0,
+            "a path that never delivered cannot be underrunning"
+        );
+    }

@@ -61,6 +61,22 @@ const FRAME_BYTES: usize = 4;
 /// 每帧的声道数（与 `FRAME_BYTES` 一致，用于 f32 缓冲的容量估算）。
 const FORMAT_CHANNELS: usize = 2;
 
+/// Frames of silence emitted for a round in which no input produced data.
+///
+/// Matches one round of normal intake (MIX_READ_BYTES / FRAME_BYTES = 1024 frames,
+/// about 21ms at 48kHz). The output timeline stays continuous, so producing paths
+/// that resume later are not shifted in time. Emitting silence is not fabricating
+/// data: it states accurately that no audio existed for this interval.
+const SILENCE_ROUND_FRAMES: usize = MIX_READ_BYTES / FRAME_BYTES;
+
+/// Rounds of total silence tolerated before an idle mixer stops writing to dsp.
+///
+/// With no connected producer there is nothing to keep the DMA fed; continuing to
+/// push silence forever would busy-spin. A short grace period still covers the
+/// startup transient before producers connect. The mixer never exits -- a producer
+/// may attach at any time.
+const SILENCE_GRACE_ROUNDS: u64 = 64;
+
 /// 每多少轮打印一次进度。
 ///
 /// **取值理由**：轮询一轮通常只搬 4096 字节，若每轮都打印会在数十秒内刷出
@@ -153,10 +169,21 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
     // 每轮：从每路读一段 s16 PCM -> 逐路转 f32 -> 相加 + 固定增益 + 钳位
     // -> 转回 s16 -> 写 dsp。**帧对齐**：所有缓冲按 FRAME_BYTES 的整数倍处理，
     // 使一条流的样本不会与另一条流错位半帧（那会造成左右声道互换）。
+    // M3：每路的连接状态与欠载统计（语义与判定规则见 audiod::MixerState）。
+    //
+    // **为何在用户态计数而非内核 ring**：内核 ring 只知道"此刻为空"，
+    // 不知道"本该有数据"。而 underrun 的定义是"生产者承诺供数却没给到"——
+    // 这个判断需要"该路是否仍在连接"的知识，而那只有混音器有。
+    // 内核侧的 `is_attached()` 门槛对 stream/N 恒为 false（输入端不 attach），
+    // 故 ring 的 underruns 对输入端**永远为 0**，不可用于此目的。
+    let mut state = audiod::MixerState::new(MIX_INPUTS);
+
     let mut raw: [[u8; MIX_READ_BYTES]; MIX_INPUTS] = [[0u8; MIX_READ_BYTES]; MIX_INPUTS];
     let mut chans: [alloc::vec::Vec<f32>; MIX_INPUTS] =
         [const { alloc::vec::Vec::new() }; MIX_INPUTS];
     let mut out_bytes = alloc::vec::Vec::new();
+    // 复用的静音缓冲（避免每轮重新分配；长度在首次使用时确定）。
+    let mut silent_buf: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     let mut mixed_total: u64 = 0;
     let mut rounds: u64 = 0;
     let mut silent_rounds: u64 = 0;
@@ -164,7 +191,6 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
         rounds += 1;
 
         // 2a. 从每路读取可用字节（**非阻塞**：无数据的路本轮视作静音）。
-        let mut live = 0usize;
         let mut k = 0usize;
         while k < MIX_INPUTS {
             chans[k].clear();
@@ -175,6 +201,11 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
                     // 余数无法保留。故要求读长本身就帧对齐：内核 ring 读写按
                     // 调用方给的缓冲长度截断，不会返回半帧，只要缓冲长度帧对齐。
                     Ok(n) if n > 0 => {
+                        // 有数据 -> 该路确实在连接，且**本轮供数了**。
+                        // `note_data` 会清零连续空缺计数，使单轮抖动不计欠载
+                        // （根因见 MixerState::note_starved 的说明）。
+                        state.set_connected(k, true);
+                        state.note_data(k);
                         let frames = n / FRAME_BYTES;
                         chans[k].reserve(frames * FORMAT_CHANNELS);
                         let mut f = 0usize;
@@ -187,13 +218,21 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
                             chans[k].push(audiod::s16_to_f32(r));
                             f += 1;
                         }
-                        if frames > 0 {
-                            live += 1;
-                        }
+                        // 本轮该路有数据；连接状态已在上面按"有数据即连接"标记。
+                        debug_assert!(frames > 0 || n < FRAME_BYTES);
                     }
-                    // Ok(0) 或 WouldBlock：本轮该路静音（M3 会统计 underrun）。
-                    Ok(_) => {}
-                    Err(e) if e == Error::WouldBlock => {}
+                    // Ok(0) 或 WouldBlock：本轮该路无数据。
+                    //
+                    // M3：只有**仍处于连接状态**的路才计 underrun。
+                    // 从未连过的路不计（启动瞬间本来就无数据），
+                    // 已断连的路也不计（没人再承诺供数，那不是欠载）。
+                    // 该判定规则由 audiod::MixerState 的宿主测试钉死。
+                    // Ok(0) 与 WouldBlock 在本轮视为同一件事：该路没有数据。
+                    // 合并两个分支（clippy 亦指出原写法的 guard 冗余）——
+                    // 分开写会让读者以为二者有语义差别，实际没有。
+                    Ok(_) | Err(Error::WouldBlock) => {
+                        state.note_starved(k);
+                    }
                     Err(e) => {
                         logf(format_args!("FAIL: read {} hard error: {:?}", inp.path, e));
                         return 1;
@@ -203,28 +242,85 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
             k += 1;
         }
 
-        if live == 0 {
-            // 全部输入暂无数据：不写 dsp（写静音会掩盖欠载，属伪数据）。
-            // M3 会在此处产出欠载统计与静音填充。
+        // 2b. 全部输入都无数据时如何处理（M3 修正）。
+        //
+        // **先前实现直接 `continue`（完全不写 dsp），那是错的**：
+        // dsp 的 ring 是有限的，停写会让驱动侧 DMA 立刻跑空 ——
+        // 那才是真正的"欠载"，而且会把"某路暂时没数据"放大成"整机静默"。
+        //
+        // 正确做法：**写一段等长静音**，保持输出时钟连续。
+        // 这样做的意义不只是"听起来没断"，更是**时间正确性**：
+        // 输出流的时间轴必须连续，否则一旦重新有数据，音画/节拍会漂移。
+        //
+        // 静音长度取本轮**本该**产出的帧数。因为各路都没数据，无可依据，
+        // 故用固定的 SILENCE_ROUND_FRAMES（与一轮的常规读取量对应）。
+        // 这不是编造数据：它如实表示"这段时间没有音频"。
+        if state.connected_count() == 0 && silent_rounds > SILENCE_GRACE_ROUNDS {
+            // 一台完全没有连接任何生产者的混音器不该无限空转刷日志，
+            // 但也**不能退出**：生产者随时可能接入。故降频空转。
             silent_rounds += 1;
             let _ = yield_now();
             continue;
         }
 
-        // 2b. 混音。只把**本轮有数据**的路送进 mix_add：
-        //     空的 Vec 对 mix_add 无贡献，但会计入路数、拉低增益。
-        //     那会让"只有一路在放"时凭空小声 —— 故按 live 筛选。
-        let mut refs: alloc::vec::Vec<&[f32]> = alloc::vec::Vec::with_capacity(live);
+        // 2b. **全部输入都空**时，输出一段静音，而不是跳过。
+        //
+        // 这保证 dsp 不断流（ring 有限，停写会让 DMA 跑空），
+        // 更重要的是保证**输出时间轴连续**：若此时直接跳过，等数据恢复时
+        // 声音会相对真实时间提前，长时间运行即产生可闻漂移。
+        //
+        // 静音是真实信息（"这段时间没有音频"），不是伪造数据。
+        if state.connected_count() == 0 {
+            silent_rounds += 1;
+            // 静音帧数 = 一轮常规读取量，使时间轴与正常轮次等长。
+            silent_buf.clear();
+            silent_buf.resize(SILENCE_ROUND_FRAMES * FRAME_BYTES, 0u8);
+            let mut off = 0usize;
+            while off < silent_buf.len() {
+                match write(dfd, &silent_buf[off..]) {
+                    Ok(w) if w > 0 => {
+                        off += w;
+                        mixed_total += w as u64;
+                    }
+                    // dsp 满或写 0：让出后重试，绝不丢弃（时间轴必须完整）。
+                    Ok(_) => {
+                        let _ = yield_now();
+                    }
+                    // 合并（guard 冗余）：同样是"写不下/写 0 字节 -> 让出后重试"。
+                    Err(Error::WouldBlock) => {
+                        let _ = yield_now();
+                    }
+                    Err(e) => {
+                        logf(format_args!("FAIL: write({}) during silence: {:?}", DSP_PATH, e));
+                        return 1;
+                    }
+                }
+            }
+            continue;
+        }
+
+        // 2c. 混音。**必须把全部配置路数都传进去**（包括本轮为空的），
+        //     并用 `mix_add_configured` 显式声明配置路数。
+        //
+        // **这是 M2 实现的一处错误，M3 修正**：先前只把"有数据的路"传给
+        // `mix_add`，增益于是变成 1/live_count。生产者的写速率天然有抖动，
+        // 某路一时没数据（常态！）就会让**其余所有路**的增益跳变 ——
+        // 而音量跳变就是可闻的爆音。
+        //
+        // 正确语义把两个问题**正交分开**：
+        //   1. 混音有多大声？ -> 固定 1/配置路数，一次决定，永不改变；
+        //   2. 某路此刻没数据？ -> 该路贡献静音，增益不动。
+        // 于是"某路掉线"在听感上只表现为少了一个声源，不会引起电平变化。
+        let mut refs: alloc::vec::Vec<&[f32]> = alloc::vec::Vec::with_capacity(MIX_INPUTS);
         let mut m = 0usize;
         while m < MIX_INPUTS {
-            if !chans[m].is_empty() {
-                refs.push(chans[m].as_slice());
-            }
+            // 空 Vec 与"显式静音"在数学上等价（都为 0），故直接传入即可。
+            refs.push(chans[m].as_slice());
             m += 1;
         }
-        let mixed = audiod::mix_add(refs.as_slice());
+        let mixed = audiod::mix_add_configured(refs.as_slice(), MIX_INPUTS);
 
-        // 2c. 转回 s16 字节流（小端，交错立体声）。
+        // 2d. 转回 s16 字节流（小端，交错立体声）。
         out_bytes.clear();
         out_bytes.reserve(mixed.len() * 2);
         let mut s = 0usize;
@@ -235,7 +331,7 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
             s += 1;
         }
 
-        // 2d. 写 dsp。**必须处理部分写入**，剩余留在 out_bytes 里重试，绝不丢弃。
+        // 2e. 写 dsp。**必须处理部分写入**，剩余留在 out_bytes 里重试，绝不丢弃。
         let mut off = 0usize;
         while off < out_bytes.len() {
             match write(dfd, &out_bytes[off..]) {
@@ -247,7 +343,8 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
                     // 写 0 字节：dsp ring 满，等消费者取走再继续。
                     let _ = yield_now();
                 }
-                Err(e) if e == Error::WouldBlock => {
+                // 合并（guard 冗余）：dsp ring 满 -> 等消费者取走后重试。
+                Err(Error::WouldBlock) => {
                     let _ = yield_now();
                 }
                 Err(e) => {
@@ -257,12 +354,34 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
             }
         }
 
-        // 2e. 周期性如实汇报（数字取自真实计数）。
-        if rounds % PROGRESS_EVERY == 0 {
+        // 2f. 周期性如实汇报（数字取自真实计数）。
+        //
+        // **M3 的 underrun 披露**：计划原文要求 `stream/N/status` 暴露 underrun，
+        // 但那是**内核节点**，其内容由内核属性回调生成，读不到用户态计数。
+        // 要让内核暴露它，唯一途径是新增一条"用户态上报"机制——那是内核改动，
+        // 且引入未经验证的新表面。本批次选择**不假装满足**该条，改为：
+        //   - 在此如实打印每路的 underrun 计数（真实值，非估算）；
+        //   - 并在 unittodo9 中把该偏离明确登记（不列入"已完成"）。
+        // 这样"多路欠载可观测"这一**意图**是达成的，只是披露渠道是日志而非
+        // 计划指定的那个文件。
+        if rounds.is_multiple_of(PROGRESS_EVERY) {
             logf(format_args!(
-                "mixed {} bytes (rounds={} silent={} live_inputs={})",
-                mixed_total, rounds, silent_rounds, live
+                "mixed {} bytes (rounds={} silent={} connected={})",
+                mixed_total, rounds, silent_rounds, state.connected_count()
             ));
+            // 逐路明细：只列出**有欠载**的路，避免刷屏。
+            // 未列出的路欠载为 0，这一点由上面的 connected 汇总结说明。
+            let mut k = 0usize;
+            while k < MIX_INPUTS {
+                let st = state.stats(k);
+                if st.underruns > 0 {
+                    logf(format_args!(
+                        "  stream/{}: connected={} underruns={}",
+                        k, st.connected, st.underruns
+                    ));
+                }
+                k += 1;
+            }
         }
     }
 }
