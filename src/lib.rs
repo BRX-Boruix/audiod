@@ -312,6 +312,13 @@ impl MixerState {
     }
 }
 
+/// Number of channels in the mixer's interleaved PCM format.
+///
+/// Defined here rather than in the binary: the resampling and mixing code is what
+/// depends on the layout, and two definitions of "how many channels" would be two
+/// things to keep in step (S15). The binary aliases this rather than restating it.
+pub const FORMAT_CHANNELS: usize = 2;
+
 /// Sample rate the mixer operates at, in Hz.
 ///
 /// Tied to the codec format the driver actually programs (48000). The ramp duration
@@ -646,6 +653,144 @@ impl Resampler {
     }
 }
 
+
+/// A stereo resampler: one [`Resampler`] per channel.
+///
+/// The two channels MUST NOT share state. A [`Resampler`] carries the previous frame for
+/// seam interpolation plus running in/out frame counts, so feeding left then right
+/// through one instance would leave the right channel starting mid-stream, offset in
+/// time from the left, and interpolating its block boundaries against left-channel
+/// samples. None of that fails loudly -- it just collapses the stereo image -- so the
+/// pairing is enforced by the type instead of by remembering to do it.
+///
+/// The scratch planes live here rather than being passed in: a caller free to supply
+/// them could hand in a buffer aliasing the interleaved input, and the borrow checker
+/// cannot distinguish that from a legitimate call.
+pub struct StereoResampler {
+    left: Resampler,
+    right: Resampler,
+    /// Per-channel working planes. Reused across calls so the steady state allocates
+    /// nothing: this runs in a daemon loop, where per-iteration allocation would
+    /// accumulate into long-term fragmentation.
+    left_plane: alloc::vec::Vec<f32>,
+    right_plane: alloc::vec::Vec<f32>,
+    scratch: alloc::vec::Vec<f32>,
+}
+
+impl StereoResampler {
+    /// Build a stereo resampler for `src_rate` to `dst_rate`.
+    pub fn new(src_rate: u32, dst_rate: u32) -> Result<Self, ResampleError> {
+        Ok(Self {
+            left: Resampler::new(src_rate, dst_rate)?,
+            right: Resampler::new(src_rate, dst_rate)?,
+            left_plane: alloc::vec::Vec::new(),
+            right_plane: alloc::vec::Vec::new(),
+            scratch: alloc::vec::Vec::new(),
+        })
+    }
+
+    /// Upper bound on the frames `process` may write for `frames` input frames.
+    ///
+    /// Callers size their output buffer with this. It is derived from the ratio rather
+    /// than guessed, and rounded up: a buffer one frame short would silently truncate
+    /// audio, because `process` stops when the output is full and the tail of the block
+    /// is then never produced.
+    ///
+    /// The ceiling uses integer arithmetic, so it cannot be off by a floating-point
+    /// rounding step at the very boundary it exists to protect.
+    pub fn output_capacity(&self, frames: usize) -> usize {
+        let src = self.left.src_rate() as usize;
+        let dst = SAMPLE_RATE_HZ as usize;
+        (frames * dst).div_ceil(src) + RESAMPLE_MARGIN
+    }
+
+    /// True when the source rate already equals the destination rate.
+    ///
+    /// Callers use this to skip the plane split entirely for the common case. It is not
+    /// an optimisation claim -- it is the same predicate [`Resampler`] uses internally to
+    /// take its bit-exact path.
+    pub fn is_identity(&self) -> bool {
+        self.left.src_rate() == SAMPLE_RATE_HZ
+    }
+
+    /// Resample interleaved stereo `input` into interleaved stereo `output`.
+    ///
+    /// `input` holds L,R pairs and is consumed entirely; the return value is the number
+    /// of frames written to `output`. `output` must be at least
+    /// `output_capacity(frames) * FORMAT_CHANNELS` long.
+    pub fn process(&mut self, input: &[f32], output: &mut [f32]) -> usize {
+        let frames = input.len() / FORMAT_CHANNELS;
+        if frames == 0 {
+            return 0;
+        }
+        // Identity: no plane split needed, and no rounding introduced.
+        if self.is_identity() {
+            let n = core::cmp::min(frames * FORMAT_CHANNELS, output.len());
+            output[..n].copy_from_slice(&input[..n]);
+            return n / FORMAT_CHANNELS;
+        }
+        // Split into planes. This is a correctness requirement, not a convenience:
+        // resampling the interleaved stream would interpolate between a left sample and
+        // the following right sample, averaging the two channels together.
+        self.left_plane.clear();
+        self.right_plane.clear();
+        let mut i = 0usize;
+        while i < frames {
+            self.left_plane.push(input[i * FORMAT_CHANNELS]);
+            self.right_plane.push(input[i * FORMAT_CHANNELS + 1]);
+            i += 1;
+        }
+        // Each channel is resampled with its own state; that is what keeps them from
+        // contaminating each other (see the note on the type).
+        let left_out = self.resample_one_channel(false);
+        let right_out = self.resample_one_channel(true);
+        // Equal by construction: identical configuration, identical input length.
+        debug_assert_eq!(left_out, right_out);
+        let n = core::cmp::min(left_out, right_out);
+        let mut f = 0usize;
+        while f < n && (f + 1) * FORMAT_CHANNELS <= output.len() {
+            output[f * FORMAT_CHANNELS] = self.left_plane[f];
+            output[f * FORMAT_CHANNELS + 1] = self.right_plane[f];
+            f += 1;
+        }
+        f
+    }
+
+    /// Resample one channel's plane in place, returning the produced frame count.
+    ///
+    /// `right` selects which channel's resampler state to use. The plane is replaced by
+    /// the resampled result, so the caller reads it back from the same field.
+    fn resample_one_channel(&mut self, right: bool) -> usize {
+        let len = if right {
+            self.right_plane.len()
+        } else {
+            self.left_plane.len()
+        };
+        // Sized from the ratio, NOT from `len + RESAMPLE_MARGIN`. Upsampling produces
+        // proportionally MORE frames than it consumes, so a scratch buffer sized just
+        // past the input length fills up and `process` stops there, silently truncating
+        // the tail of every block. The first version made exactly that mistake and dropped
+        // about 88 frames per 1024-frame block at 44.1k -> 48k.
+        self.scratch.clear();
+        self.scratch.resize(self.output_capacity(len), 0.0);
+        let (rs, plane) = if right {
+            (&mut self.right, &mut self.right_plane)
+        } else {
+            (&mut self.left, &mut self.left_plane)
+        };
+        let (_used, produced) = rs.process(plane, &mut self.scratch);
+        plane.clear();
+        plane.extend_from_slice(&self.scratch[..produced]);
+        produced
+    }
+}
+
+/// Extra output room the resampler may need beyond the input frame count.
+///
+/// Upsampling emits proportionally more frames than it consumes, and the exact count
+/// depends on the ratio. Two frames covers the rounding at a block boundary; it is a
+/// bound on the arithmetic, not a tuning knob.
+const RESAMPLE_MARGIN: usize = 2;
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1508,5 +1653,138 @@ mod tests {
             Resampler::new(11_025, 48_000).err(),
             Some(ResampleError::UnsupportedInputRate)
         );
+    }
+
+    /// M5: the two channels must be resampled with INDEPENDENT state.
+    ///
+    /// Sharing one resampler between channels would offset the right channel in time and
+    /// interpolate its block boundaries against left-channel samples. Nothing about that
+    /// fails loudly -- the pitch stays right -- so it is pinned by giving the channels
+    /// clearly different signals and checking each survives intact.
+    ///
+    /// Left is a rising ramp and right is its negation, so any leakage between them shows
+    /// up as a sign or magnitude error rather than as a subtle blur.
+    #[test]
+    fn test_m5_stereo_channels_do_not_leak_into_each_other() {
+        let frames = 1000usize;
+        let mut interleaved: Vec<f32> = alloc::vec::Vec::new();
+        let mut i = 0usize;
+        while i < frames {
+            interleaved.push(i as f32);
+            interleaved.push(-(i as f32));
+            i += 1;
+        }
+        let mut sr = StereoResampler::new(44_100, 48_000).expect("supported");
+        let mut out = alloc::vec![0.0f32; sr.output_capacity(frames) * FORMAT_CHANNELS];
+        let n = sr.process(&interleaved, &mut out);
+        assert!(n > 100, "expected audio, got {n} frames");
+        let mut f = 0usize;
+        while f < n {
+            let l = out[f * FORMAT_CHANNELS];
+            let r = out[f * FORMAT_CHANNELS + 1];
+            // Right is the exact negation of left. Interpolation is linear, so this holds
+            // exactly rather than approximately.
+            assert!(
+                (l + r).abs() < 1e-3,
+                "channel leak at frame {f}: left={l} right={r}"
+            );
+            f += 1;
+        }
+    }
+
+    /// M5: the right channel must not start late.
+    ///
+    /// The specific failure of shared state: the left channel advances the frame counter,
+    /// so the right channel resumes from wherever the left left off and silently drops its
+    /// opening frames. Checking every frame of a constant signal catches it.
+    #[test]
+    fn test_m5_stereo_right_channel_does_not_start_late() {
+        let frames = 600usize;
+        let mut interleaved: Vec<f32> = alloc::vec::Vec::new();
+        let mut i = 0usize;
+        while i < frames {
+            interleaved.push(0.25);
+            interleaved.push(-0.75);
+            i += 1;
+        }
+        let mut sr = StereoResampler::new(44_100, 48_000).expect("supported");
+        let mut out = alloc::vec![0.0f32; sr.output_capacity(frames) * FORMAT_CHANNELS];
+        let n = sr.process(&interleaved, &mut out);
+        assert!(n > 100, "expected audio, got {n} frames");
+        // A constant signal interpolates to itself, so every frame must carry the
+        // original constants regardless of position.
+        let mut f = 0usize;
+        while f < n {
+            assert!(
+                (out[f * FORMAT_CHANNELS] - 0.25).abs() < 1e-6,
+                "left drifted at frame {f}"
+            );
+            assert!(
+                (out[f * FORMAT_CHANNELS + 1] + 0.75).abs() < 1e-6,
+                "right drifted at frame {f}"
+            );
+            f += 1;
+        }
+    }
+
+    /// M5: a 48k stereo stream must pass through bit-exactly.
+    ///
+    /// This is the common case, so it is the one that must not pay any cost. A single
+    /// rounding step here would accumulate across the whole stream for no benefit.
+    #[test]
+    fn test_m5_stereo_identity_is_bit_exact() {
+        let frames = 256usize;
+        let mut interleaved: Vec<f32> = alloc::vec::Vec::new();
+        let mut i = 0usize;
+        while i < frames {
+            interleaved.push(i as f32 * 0.001);
+            interleaved.push(-(i as f32) * 0.001);
+            i += 1;
+        }
+        let mut sr = StereoResampler::new(48_000, 48_000).expect("identity");
+        assert!(sr.is_identity());
+        let mut out = alloc::vec![0.0f32; frames * FORMAT_CHANNELS];
+        let n = sr.process(&interleaved, &mut out);
+        assert_eq!(n, frames);
+        assert_eq!(&out[..n * FORMAT_CHANNELS], &interleaved[..]);
+    }
+
+    /// M5: `output_capacity` must never be smaller than what `process` writes.
+    ///
+    /// Size the buffer with the reported bound and check nothing is dropped: a bound one
+    /// frame short would silently truncate the tail of every block.
+    #[test]
+    fn test_m5_output_capacity_is_never_short() {
+        let rates = [(44_100u32, 48_000u32), (16_000, 48_000), (22_050, 48_000), (32_000, 48_000)];
+        for (src, dst) in rates {
+            let frames = 1024usize;
+            let mut interleaved: Vec<f32> = alloc::vec::Vec::new();
+            let mut i = 0usize;
+            while i < frames {
+                interleaved.push(0.5);
+                interleaved.push(-0.5);
+                i += 1;
+            }
+            let mut sr = StereoResampler::new(src, dst).expect("supported");
+            let cap = sr.output_capacity(frames);
+            let mut out = alloc::vec![0.0f32; cap * FORMAT_CHANNELS];
+            let n = sr.process(&interleaved, &mut out);
+            assert!(n <= cap, "{src}->{dst}: wrote {n} frames into capacity {cap}");
+            let expect = frames * dst as usize / src as usize;
+            // The shortfall is derived, not a tolerance. Output `k` needs input frames
+            // `floor(k*src/dst)` and `+1`, and the last input frame can never be a right
+            // neighbour -- so the tail that cannot be produced is at most one input
+            // frame worth of output, i.e. `dst/src` frames. It is a constant per block,
+            // not a growing error (the next block reuses the last frame as its left
+            // neighbour). At 16k->48k that is 3 frames per 1024, which `expect - 1`
+            // would have failed on while being perfectly correct.
+            let max_tail = (dst as usize).div_ceil(src as usize) + 1;
+            assert!(
+                n + max_tail >= expect,
+                "{src}->{dst}: wrote {n}, expected at least {} of {expect}",
+                expect - max_tail
+            );
+            assert!(n <= expect + 1, "{src}->{dst}: wrote {n}, more than {expect}");
+        }
     }
 }

@@ -58,8 +58,9 @@ const MIX_READ_BYTES: usize = 4096;
 /// M4/批次五若要支持其它格式，必须让本常量与格式同步变化，而非各处硬编码。
 const FRAME_BYTES: usize = 4;
 
-/// 每帧的声道数（与 `FRAME_BYTES` 一致，用于 f32 缓冲的容量估算）。
-const FORMAT_CHANNELS: usize = 2;
+/// 每帧的声道数。**单点定义在库中**（audiod::FORMAT_CHANNELS），
+/// 这里只做别名，避免同一个事实有两处定义（S15）。
+const FORMAT_CHANNELS: usize = audiod::FORMAT_CHANNELS;
 
 /// Frames of silence emitted for a round in which no input produced data.
 ///
@@ -97,6 +98,11 @@ const DEMO_VOLUME_ROUND: u64 = 64;
 /// "在持续推进"，又不至于刷屏。
 const PROGRESS_EVERY: u64 = 64;
 
+/// rate 属性文本的最大长度（如 `"48000\n"` 共 6 字节；留足余量）。
+///
+/// 属性读取是**定长缓冲**读取：超出该长度的内容会被截断，而截断的 rate
+/// 解析必然失败并如实报错——不会静默产生错误速率。
+const RATE_BUF_BYTES: usize = 32;
 /// 一路已打开的输入流。
 ///
 /// `path` 保留是为了错误信息能指名道姓（编号 + 路径），而不是只报下标——
@@ -104,8 +110,146 @@ const PROGRESS_EVERY: u64 = 64;
 struct Input {
     fd: u64,
     path: alloc::string::String,
+    /// M5: resampler for this path, chosen from the rate the kernel reports for it.
+    ///
+    /// Built once at open time and never rebuilt: the rate is part of the stream's
+    /// format contract, and changing it mid-stream would invalidate the phase the
+    /// resampler has accumulated. A path whose rate cannot be read stays `None` and its
+    /// samples are used as-is, which is only correct at the bus rate -- so the read
+    /// failure is reported rather than silently assumed away.
+    resampler: Option<audiod::StereoResampler>,
 }
 
+
+/// 把一路的原始 PCM 转成 f32、按需重采样、再施加音量，追加到 `out`。
+///
+/// 分离成独立函数而不是留在大循环里，是因为这里有三个**必须按顺序**发生的
+/// 步骤，顺序错了不会崩、只会让声音不对（S24 单组件专注）：
+///
+/// 1. 字节 -> f32（按帧解析，左右分开）；
+/// 2. 重采样到总线速率（若有重采样器）；
+/// 3. 施加音量（逐样本推进斜坡）。
+///
+/// 顺序要点：音量在**重采样之后**施加。斜坡以**输出**采样率计时，
+/// 若在重采样前施加，同一斜坡在不同源速率下的时长就不同，
+/// 约 5ms 这个设计值便只对 48k 源成立——那正是隐性魔法值（S13）。
+///
+/// `resampler` 为 `None` 时按原样使用输入样本。这**只在**该路确实是总线速率
+/// 时才正确，故取不到 rate 时 `read_stream_rate` 会如实告警而非静默走到这里（S20）。
+fn convert_and_resample(
+    raw: &[u8],
+    resampler: Option<&mut audiod::StereoResampler>,
+    src_plane_l: &mut alloc::vec::Vec<f32>,
+    src_plane_r: &mut alloc::vec::Vec<f32>,
+    interleaved: &mut alloc::vec::Vec<f32>,
+    resample_out: &mut alloc::vec::Vec<f32>,
+    out: &mut alloc::vec::Vec<f32>,
+    ramp: &mut audiod::Ramp,
+) {
+    let src_frames = raw.len() / FRAME_BYTES;
+    if src_frames == 0 {
+        return;
+    }
+    src_plane_l.clear();
+    src_plane_r.clear();
+    let mut f = 0usize;
+    while f < src_frames {
+        let o = f * FRAME_BYTES;
+        let l = i16::from_le_bytes([raw[o], raw[o + 1]]);
+        let r = i16::from_le_bytes([raw[o + 2], raw[o + 3]]);
+        src_plane_l.push(audiod::s16_to_f32(l));
+        src_plane_r.push(audiod::s16_to_f32(r));
+        f += 1;
+    }
+
+    match resampler {
+        None => {
+            // 该路已是总线速率（或取不到 rate 且已告警）：逐帧施加音量即可。
+            out.reserve(src_frames * FORMAT_CHANNELS);
+            let mut i = 0usize;
+            while i < src_frames {
+                let vg = ramp.next_sample();
+                out.push(src_plane_l[i] * vg);
+                out.push(src_plane_r[i] * vg);
+                i += 1;
+            }
+        }
+        Some(sr) => {
+            // 交织回交错格式再交给 StereoResampler（它按平面拆分后各自重采样）。
+            interleaved.clear();
+            interleaved.reserve(src_frames * FORMAT_CHANNELS);
+            let mut i = 0usize;
+            while i < src_frames {
+                interleaved.push(src_plane_l[i]);
+                interleaved.push(src_plane_r[i]);
+                i += 1;
+            }
+            let cap = sr.output_capacity(src_frames);
+            resample_out.clear();
+            resample_out.resize(cap * FORMAT_CHANNELS, 0.0);
+            let n = sr.process(interleaved, resample_out);
+            // 音量在**重采样之后**施加：斜坡以输出速率计时，
+            // 若在重采样前施加，同一斜坡在不同源速率下的时长就不同。
+            out.reserve(n * FORMAT_CHANNELS);
+            let mut k = 0usize;
+            while k < n {
+                let vg = ramp.next_sample();
+                out.push(resample_out[k * FORMAT_CHANNELS] * vg);
+                out.push(resample_out[k * FORMAT_CHANNELS + 1] * vg);
+                k += 1;
+            }
+        }
+    }
+}
+
+/// 读取某一路输入流的采样率（Hz）。
+///
+/// 内核为每个 `stream/N` 提供只读的 `rate` 属性（见 vfs `audio.rs` 的 rate 节点）。
+/// **格式由内核报告而非由本进程假定**——若这里写死 48000，任何一路被配成别的
+/// 采样率时，混音器都会以错误速度播放它，而且听起来只是音调略偏，极难归因
+/// （S13/S40：不臆测环境，读真实来源）。
+///
+/// 返回 `None` 表示该路没有可用的 rate（如内核版本不一致）。调用方如实记录
+/// 并**不重采样**，而不是假定一个值继续跑。
+fn read_stream_rate(stream_path: &str) -> Option<u32> {
+    let path = alloc::format!("{}/rate", stream_path);
+    let fd = match open(path.as_str(), OpenFlags::READ_ONLY, Permissions::readonly()) {
+        Ok(fd) => fd,
+        Err(e) => {
+            logf(format_args!("warn: open({}) failed: {:?}; no resampling on this path", path, e));
+            return None;
+        }
+    };
+    let mut buf = [0u8; RATE_BUF_BYTES];
+    let n = match read(fd, &mut buf) {
+        Ok(n) => n,
+        Err(e) => {
+            logf(format_args!("warn: read({}) failed: {:?}; no resampling on this path", path, e));
+            let _ = close(fd);
+            return None;
+        }
+    };
+    // 属性是普通文件，读完即关。失败要如实记录（S18 资源生命周期）。
+    if close(fd).is_err() {
+        logf(format_args!("warn: close({}) failed", path));
+    }
+    // 属性以文本给出（如 "48000\n"）。解析失败即如实报错，
+    // 绝不 default 到 48000——那会把"读不到"伪装成"读到了 48k"（S20）。
+    let text = match core::str::from_utf8(&buf[..n]) {
+        Ok(s) => s.trim(),
+        Err(_) => {
+            logf(format_args!("warn: rate of {} is not UTF-8; no resampling", stream_path));
+            return None;
+        }
+    };
+    match text.parse::<u32>() {
+        Ok(rate) => Some(rate),
+        Err(_) => {
+            logf(format_args!("warn: rate {:?} unparsable; no resampling", text));
+            None
+        }
+    }
+}
 /// 向 STDOUT 输出一行日志（`[audiod] ...`）。
 fn log(msg: &[u8]) {
     let _ = write(STDOUT, b"[audiod] ");
@@ -145,7 +289,20 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
         let path = alloc::format!("{}/{}", STREAM_DIR, i);
         match open(path.as_str(), OpenFlags::READ_ONLY, Permissions::readonly()) {
             Ok(fd) => {
-                inputs[i] = Some(Input { fd, path });
+                let resampler = match read_stream_rate(path.as_str()) {
+                    Some(rate) => match audiod::StereoResampler::new(rate, audiod::SAMPLE_RATE_HZ) {
+                        Ok(r) => Some(r),
+                        Err(e) => {
+                            // A rate the resampler refuses is a real configuration error:
+                            // the stream would be mixed at the wrong speed. Reporting and
+                            // exiting is the honest option; guessing a rate is not.
+                            logf(format_args!("FAIL: input {} rate {} unsupported: {:?}", i, rate, e));
+                            return 1;
+                        }
+                    },
+                    None => None,
+                };
+                inputs[i] = Some(Input { fd, path, resampler });
                 opened += 1;
             }
             Err(e) => {
@@ -213,6 +370,22 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
     let mut raw: [[u8; MIX_READ_BYTES]; MIX_INPUTS] = [[0u8; MIX_READ_BYTES]; MIX_INPUTS];
     let mut chans: [alloc::vec::Vec<f32>; MIX_INPUTS] =
         [const { alloc::vec::Vec::new() }; MIX_INPUTS];
+    // M5：重采样所需的工作缓冲，全部复用以免每轮分配。
+    //
+    // 左右必须**分平面**处理：交错序列里相邻两点是 L 和 R，直接插值会
+    // 在左右之间取平均，把立体声糊成一个声道。拆平面是正确性要求，
+    // 不是优化（见 StereoResampler 的说明）。
+    //
+    // 复用是必要的：每轮 1024 帧，若每轮重新分配，分配器压力会随
+    // 运行时间线性累积成碎片 —— 这是长期运行的守护进程，不是一次性程序。
+    let mut plane_l: [alloc::vec::Vec<f32>; MIX_INPUTS] =
+        [const { alloc::vec::Vec::new() }; MIX_INPUTS];
+    let mut plane_r: [alloc::vec::Vec<f32>; MIX_INPUTS] =
+        [const { alloc::vec::Vec::new() }; MIX_INPUTS];
+    let mut scratch: [alloc::vec::Vec<f32>; MIX_INPUTS] =
+        [const { alloc::vec::Vec::new() }; MIX_INPUTS];
+    let mut resample_out: [alloc::vec::Vec<f32>; MIX_INPUTS] =
+        [const { alloc::vec::Vec::new() }; MIX_INPUTS];
     let mut out_bytes = alloc::vec::Vec::new();
     // 复用的静音缓冲（避免每轮重新分配；长度在首次使用时确定）。
     let mut silent_buf: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
@@ -231,7 +404,7 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
         let mut k = 0usize;
         while k < MIX_INPUTS {
             chans[k].clear();
-            if let Some(inp) = inputs[k].as_ref() {
+            if let Some(inp) = inputs[k].as_mut() {
                 match read(inp.fd, &mut raw[k]) {
                     // 读到字节：转 f32。仅取 FRAME_BYTES 的整数倍，余数留到下一轮
                     // ——但 DspNode 的 read 是**消费**语义（读走即 commit），
@@ -243,27 +416,20 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
                         // （根因见 MixerState::note_starved 的说明）。
                         state.set_connected(k, true);
                         state.note_data(k);
-                        let frames = n / FRAME_BYTES;
-                        chans[k].reserve(frames * FORMAT_CHANNELS);
-                        let mut f = 0usize;
-                        while f < frames {
-                            let o = f * FRAME_BYTES;
-                            let l = i16::from_le_bytes([raw[k][o], raw[k][o + 1]]);
-                            let r = i16::from_le_bytes([raw[k][o + 2], raw[k][o + 3]]);
-                            // 立体声源：两声道**各自**转 f32（不做下混）。
-                            // M4：**逐样本**取当前音量并推进斜坡。
-                            //
-                            // 必须逐样本而非逐块：逐块会让整块用同一个音量，
-                            // 块边界上形成台阶——那正是斜坡要消除的跳变。
-                            // 逐样本推进使音量在整个块内平滑变化。
-                            let vg = ramps[k].next_sample();
-                            chans[k].push(audiod::s16_to_f32(l) * vg);
-                            chans[k].push(audiod::s16_to_f32(r) * vg);
-                            f += 1;
-                        }
-                        // 本轮该路确实有数据（帧数 > 0 才算，半个帧不算）。
-                        // 这个计数决定该轮输出的**组成**，是解读采样幅度的依据。
-                        if frames > 0 {
+                        let src_frames = n / FRAME_BYTES;
+                        if src_frames > 0 {
+                            // chans[k] 本轮的产出帧数由重采样决定；音量在
+                            // 重采样**之后**逐样本施加（见 convert_and_resample）。
+                            convert_and_resample(
+                                &raw[k][..n],
+                                inp.resampler.as_mut(),
+                                &mut plane_l[k],
+                                &mut plane_r[k],
+                                &mut scratch[k],
+                                &mut resample_out[k],
+                                &mut chans[k],
+                                &mut ramps[k],
+                            );
                             live_now += 1;
                         }
                     }
