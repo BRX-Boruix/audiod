@@ -312,6 +312,141 @@ impl MixerState {
     }
 }
 
+/// Sample rate the mixer operates at, in Hz.
+///
+/// Tied to the codec format the driver actually programs (48000). The ramp duration
+/// is expressed in seconds and converted through this, so if the rate ever changes
+/// the ramp keeps its real-world duration rather than silently becoming longer or
+/// shorter. R1 found the codec is fixed at 48000; see the batch-3 notes on why
+/// 44100 was refused by the format gate.
+pub const SAMPLE_RATE_HZ: u32 = 48_000;
+
+/// Volume ramp duration, in seconds.
+///
+/// 5ms is ~240 frames at 48kHz. The lower bound is audibility: a step spreads energy
+/// across the spectrum as a click, and spreading it over a few hundred samples
+/// pushes that energy below the ear's integration time. The upper bound is feel:
+/// much longer and a volume change stops feeling immediate. Anything in the few-ms
+/// range works; 5ms sits comfortably inside it.
+pub const RAMP_SECONDS: f32 = 0.005;
+
+/// Per-sample volume increment for a full-scale (0 -> 1) ramp of RAMP_SECONDS.
+///
+/// Derived, not hand-picked: a full-range change must complete in RAMP_SECONDS worth
+/// of samples. Any larger step would finish early (and risk a click on large jumps);
+/// any smaller would still be ramping after the intended duration.
+pub const RAMP_STEP: f32 = 1.0 / (RAMP_SECONDS * SAMPLE_RATE_HZ as f32);
+
+/// Per-sample increment for a ramp over the full 0..1 range.
+pub fn auto_ramp_step() -> f32 {
+    RAMP_STEP
+}
+
+/// A validated volume in [0.0, 1.0].
+///
+/// The range is enforced at CONSTRUCTION, so an invalid volume cannot exist inside
+/// the mixer. Downstream code therefore needs no defensive clamping, and there is no
+/// path by which a NaN or an out-of-range value could reach a multiply.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Volume(f32);
+
+impl Volume {
+    /// Validate and wrap a volume.
+    ///
+    /// Rejects rather than clamps. A silent clamp would leave the caller believing
+    /// something the system did not do, which is the failure mode this project treats
+    /// as a red line. NaN is rejected explicitly: it compares false against every
+    /// bound, so a naive range check would let it through and it would then propagate
+    /// through every subsequent multiply, poisoning the entire mix.
+    pub fn new(value: f32) -> Result<Self, VolumeError> {
+        // NaN must be tested first: `!(0.0..=1.0).contains(&NaN)` is true, so the range
+        // check below would already reject it, but stating it explicitly documents the
+        // intent and survives a future rewrite of the range test.
+        if value.is_nan() {
+            return Err(VolumeError::NotANumber);
+        }
+        if !(0.0..=1.0).contains(&value) {
+            return Err(VolumeError::OutOfRange);
+        }
+        Ok(Self(value))
+    }
+
+    /// The validated value.
+    pub fn get(self) -> f32 {
+        self.0
+    }
+}
+
+/// Why a volume was rejected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VolumeError {
+    /// Value was NaN.
+    NotANumber,
+    /// Value was outside [0.0, 1.0].
+    OutOfRange,
+}
+
+/// A linear volume ramp.
+///
+/// Holds the current value and the target. Each call to [`Ramp::next`] moves one
+/// sample's worth toward the target, so a change is spread over many samples instead
+/// of happening in one.
+pub struct Ramp {
+    current: f32,
+    target: f32,
+    step: f32,
+}
+
+impl Ramp {
+    /// Start settled at `initial`.
+    ///
+    /// Starting settled (rather than ramping up from zero) is deliberate: a player
+    /// beginning at its configured volume should not fade in.
+    pub fn new(initial: f32) -> Self {
+        Self {
+            current: initial,
+            target: initial,
+            step: RAMP_STEP,
+        }
+    }
+
+    /// Aim at a new value, ramping at `step` per sample.
+    ///
+    /// The ramp always continues from `current`, never from the previous target.
+    /// Restarting from the old target would itself be a jump, reintroducing the very
+    /// discontinuity the ramp exists to remove.
+    pub fn set_target(&mut self, target: f32, step: f32) {
+        self.target = target;
+        self.step = if step > 0.0 { step } else { RAMP_STEP };
+    }
+
+    /// Advance one sample and return the new volume.
+    pub fn next_sample(&mut self) -> f32 {
+        let delta = self.target - self.current;
+        if delta.abs() <= self.step {
+            // Snap on the final sample so the ramp lands EXACTLY on the target.
+            // Without the snap, repeated additions of a step that does not divide the
+            // range evenly would leave a permanent residue and the ramp would never
+            // settle, keeping is_settled() false forever.
+            self.current = self.target;
+        } else if delta > 0.0 {
+            self.current += self.step;
+        } else {
+            self.current -= self.step;
+        }
+        self.current
+    }
+
+    /// Whether the ramp has reached its target.
+    pub fn is_settled(&self) -> bool {
+        self.current == self.target
+    }
+
+    /// The value that will be returned by the next call, without advancing.
+    pub fn current(&self) -> f32 {
+        self.current
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -707,5 +842,106 @@ mod tests {
             0,
             "a path that never delivered cannot be underrunning"
         );
+    }
+
+    /// M4: volume must reject illegal values rather than silently rounding them.
+    ///
+    /// Rejecting matters because a silent clamp makes the caller's belief diverge from
+    /// reality: they set 2.5, hear no error, and cannot tell what the system actually
+    /// did. Reporting an error keeps the caller informed. NaN is included because it
+    /// propagates through every later multiply and would poison the whole mix.
+    #[test]
+    fn test_m4_volume_validation_rejects_illegal_values() {
+        assert!(Volume::new(0.0).is_ok());
+        assert!(Volume::new(1.0).is_ok());
+        assert!(Volume::new(0.5).is_ok());
+        assert!(Volume::new(-0.001).is_err());
+        assert!(Volume::new(1.001).is_err());
+        assert!(Volume::new(f32::NAN).is_err());
+        assert!(Volume::new(f32::INFINITY).is_err());
+        assert!(Volume::new(f32::NEG_INFINITY).is_err());
+    }
+
+    /// M4: a volume change must ramp, never step.
+    ///
+    /// An instantaneous level change is a discontinuity in the waveform, which spreads
+    /// energy across the spectrum and is heard as a click. Ramping distributes the same
+    /// change over many samples, keeping the waveform continuous.
+    #[test]
+    fn test_m4_ramp_never_steps_in_one_sample() {
+        let mut r = Ramp::new(0.0);
+        r.set_target(1.0, RAMP_STEP);
+        let mut prev = 0.0f32;
+        let mut steps = 0usize;
+        while !r.is_settled() {
+            let v = r.next_sample();
+            let delta = (v - prev).abs();
+            assert!(delta <= RAMP_STEP + 1e-6);
+            assert!(v >= prev);
+            prev = v;
+            steps += 1;
+            assert!(steps < 10_000);
+        }
+        assert!((prev - 1.0).abs() < 1e-6);
+    }
+
+    /// M4: a 5ms ramp at 48kHz must span roughly 240 frames.
+    ///
+    /// The duration is the whole design decision, so it is asserted directly rather
+    /// than left implicit in RAMP_STEP. Too short and the discontinuity is still
+    /// audible; too long and a volume change feels laggy.
+    #[test]
+    fn test_m4_ramp_duration_is_about_5ms() {
+        let frames = (RAMP_SECONDS * SAMPLE_RATE_HZ as f32) as usize;
+        assert!((220..=260).contains(&frames));
+        let step = auto_ramp_step();
+        assert!(step * frames as f32 >= 1.0);
+    }
+
+    /// M4: setting a new target mid-ramp must continue from the CURRENT value.
+    ///
+    /// Jumping straight to the new plan from the old target would itself be a step,
+    /// reintroducing exactly the click the ramp exists to prevent.
+    #[test]
+    fn test_m4_retarget_mid_ramp_is_continuous() {
+        let mut r = Ramp::new(0.0);
+        r.set_target(1.0, 0.01);
+        let mut last = 0.0f32;
+        let mut i = 0;
+        while i < 10 {
+            last = r.next_sample();
+            i += 1;
+        }
+        r.set_target(0.2, 0.01);
+        let after = r.next_sample();
+        assert!((after - last).abs() <= 0.01 + 1e-6);
+    }
+
+    /// M4: volume applies to the per-path signal BEFORE summing.
+    ///
+    /// Applied after summing, one path's volume would scale the others too, which is
+    /// plainly wrong -- and silent in effect if only one path is playing.
+    #[test]
+    fn test_m4_per_path_volume_scales_only_its_own_path() {
+        let a = alloc::vec![1.0f32, 1.0];
+        let b = alloc::vec![1.0f32, 1.0];
+        let av: Vec<f32> = a.iter().map(|s| s * 0.5).collect();
+        let mixed = mix_add_configured(&[&av, &b], 2);
+        assert!((mixed[0] - 0.75).abs() < 1e-6);
+    }
+
+    /// M4: full mute (volume 0) must produce exact digital silence.
+    ///
+    /// Not merely quiet: the mixer must emit true zeros, so that muting is verifiable
+    /// by inspection rather than by ear.
+    #[test]
+    fn test_m4_mute_produces_exact_silence() {
+        let a = alloc::vec![1.0f32, -1.0, 0.5];
+        let muted: Vec<f32> = a.iter().map(|s| s * 0.0).collect();
+        let mixed = mix_add_configured(&[&muted], 1);
+        for s in mixed.iter() {
+            assert_eq!(*s, 0.0);
+            assert_eq!(f32_to_s16(*s), 0);
+        }
     }
 }

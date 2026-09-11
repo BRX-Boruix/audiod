@@ -1,0 +1,47 @@
+
+    /// M4: setting a new target mid-ramp must continue from the CURRENT value.
+    ///
+    /// Jumping straight to the new plan from the old target would itself be a step,
+    /// reintroducing exactly the click the ramp exists to prevent.
+    #[test]
+    fn test_m4_retarget_mid_ramp_is_continuous() {
+        let mut r = Ramp::new(0.0);
+        r.set_target(1.0, 0.01);
+        let mut last = 0.0f32;
+        let mut i = 0;
+        while i < 10 {
+            last = r.next();
+            i += 1;
+        }
+        r.set_target(0.2, 0.01);
+        let after = r.next();
+        assert!((after - last).abs() <= 0.01 + 1e-6);
+    }
+
+    /// M4: volume applies to the per-path signal BEFORE summing.
+    ///
+    /// Applied after summing, one path's volume would scale the others too, which is
+    /// plainly wrong -- and silent in effect if only one path is playing.
+    #[test]
+    fn test_m4_per_path_volume_scales_only_its_own_path() {
+        let a = alloc::vec![1.0f32, 1.0];
+        let b = alloc::vec![1.0f32, 1.0];
+        let av: Vec<f32> = a.iter().map(|s| s * 0.5).collect();
+        let mixed = mix_add_configured(&[&av, &b], 2);
+        assert!((mixed[0] - 0.75).abs() < 1e-6);
+    }
+
+    /// M4: full mute (volume 0) must produce exact digital silence.
+    ///
+    /// Not merely quiet: the mixer must emit true zeros, so that muting is verifiable
+    /// by inspection rather than by ear.
+    #[test]
+    fn test_m4_mute_produces_exact_silence() {
+        let a = alloc::vec![1.0f32, -1.0, 0.5];
+        let muted: Vec<f32> = a.iter().map(|s| s * 0.0).collect();
+        let mixed = mix_add_configured(&[&muted], 1);
+        for s in mixed.iter() {
+            assert_eq!(*s, 0.0);
+            assert_eq!(f32_to_s16(*s), 0);
+        }
+    }

@@ -77,6 +77,19 @@ const SILENCE_ROUND_FRAMES: usize = MIX_READ_BYTES / FRAME_BYTES;
 /// may attach at any time.
 const SILENCE_GRACE_ROUNDS: u64 = 64;
 
+/// Mixed-audio round at which the M4 demonstration changes stream/0 volume.
+///
+/// Counted over rounds that actually mixed audio (live_now > 0), NOT over total
+/// loop iterations. Total iterations include long idle stretches -- measured at
+/// 14144 rounds while audio ended near round 192 -- so a threshold on the total
+/// fires after the music is over, proving nothing. This counter advances only
+/// while sound is being produced, so the change is guaranteed to land inside the
+/// audible window.
+///
+/// 64 mixed rounds is roughly 256 KiB of audio (about 1.4s at 48kHz): late enough
+/// that startup transients are past, early enough to leave a long steady tail.
+const DEMO_VOLUME_ROUND: u64 = 64;
+
 /// 每多少轮打印一次进度。
 ///
 /// **取值理由**：轮询一轮通常只搬 4096 字节，若每轮都打印会在数十秒内刷出
@@ -178,12 +191,33 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
     // 故 ring 的 underruns 对输入端**永远为 0**，不可用于此目的。
     let mut state = audiod::MixerState::new(MIX_INPUTS);
 
+    // M4：每路的音量与斜坡。
+    //
+    // **软件音量 vs 硬件 AMP 音量（必须区分，计划明确要求）**：
+    //   - **软件音量**（此处）：在**用户态**对 PCM 样本做乘法。优点是完全通用、
+    //     与具体 codec 无关、多路可各自不同；代价是低音量时**损失有效位深**
+    //     （16 位乘 0.1 只剩约 13 位有效精度）。
+    //   - **硬件 AMP 音量**（批次六 R3）：经 codec 的 AMP 增益寄存器调，在**模拟**
+    //     域衰减，不损失数字精度；但每路能否独立、范围多大，取决于具体 codec
+    //     的 AMP_CAP 位图（R1 已读但本批次不做路由/AMP 写）。
+    //
+    // 本批次只做软件音量：它不依赖 codec 能力，可在 QEMU 上完整验证；
+    // 硬件 AMP 需要真实 codec 能力且属 R3 范围。二者**不互相替代**——
+    // 软件音量用于混音级控制，硬件 AMP 用于最终模拟输出的增益。
+    //
+    // 初始为 1.0（不衰减）：默认改变用户听到的东西是错的，音量应由使用者设定。
+    // `Ramp::new` 不是 const fn（它做的是普通构造，无 const 需求），
+    // 故用运行时循环填数组，而不是 `[const { ... }; N]`。
+    let mut ramps: [audiod::Ramp; MIX_INPUTS] = core::array::from_fn(|_| audiod::Ramp::new(1.0));
+
     let mut raw: [[u8; MIX_READ_BYTES]; MIX_INPUTS] = [[0u8; MIX_READ_BYTES]; MIX_INPUTS];
     let mut chans: [alloc::vec::Vec<f32>; MIX_INPUTS] =
         [const { alloc::vec::Vec::new() }; MIX_INPUTS];
     let mut out_bytes = alloc::vec::Vec::new();
     // 复用的静音缓冲（避免每轮重新分配；长度在首次使用时确定）。
     let mut silent_buf: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    // 真正混过音频的轮次（区别于总轮次，后者含大量空转）。M4 用它触发音量变更。
+    let mut mixed_rounds: u64 = 0;
     let mut mixed_total: u64 = 0;
     let mut rounds: u64 = 0;
     let mut silent_rounds: u64 = 0;
@@ -191,6 +225,9 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
         rounds += 1;
 
         // 2a. 从每路读取可用字节（**非阻塞**：无数据的路本轮视作静音）。
+        // 本轮实际取到数据的路数（决定该轮输出的组成）。
+        let mut live_now = 0usize;
+        // 混音轮次计数（只统计 live_now > 0 的轮次，见下方 M4 说明）。
         let mut k = 0usize;
         while k < MIX_INPUTS {
             chans[k].clear();
@@ -214,12 +251,21 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
                             let l = i16::from_le_bytes([raw[k][o], raw[k][o + 1]]);
                             let r = i16::from_le_bytes([raw[k][o + 2], raw[k][o + 3]]);
                             // 立体声源：两声道**各自**转 f32（不做下混）。
-                            chans[k].push(audiod::s16_to_f32(l));
-                            chans[k].push(audiod::s16_to_f32(r));
+                            // M4：**逐样本**取当前音量并推进斜坡。
+                            //
+                            // 必须逐样本而非逐块：逐块会让整块用同一个音量，
+                            // 块边界上形成台阶——那正是斜坡要消除的跳变。
+                            // 逐样本推进使音量在整个块内平滑变化。
+                            let vg = ramps[k].next_sample();
+                            chans[k].push(audiod::s16_to_f32(l) * vg);
+                            chans[k].push(audiod::s16_to_f32(r) * vg);
                             f += 1;
                         }
-                        // 本轮该路有数据；连接状态已在上面按"有数据即连接"标记。
-                        debug_assert!(frames > 0 || n < FRAME_BYTES);
+                        // 本轮该路确实有数据（帧数 > 0 才算，半个帧不算）。
+                        // 这个计数决定该轮输出的**组成**，是解读采样幅度的依据。
+                        if frames > 0 {
+                            live_now += 1;
+                        }
                     }
                     // Ok(0) 或 WouldBlock：本轮该路无数据。
                     //
@@ -354,7 +400,39 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
             }
         }
 
-        // 2f. 周期性如实汇报（数字取自真实计数）。
+        // 2f. M4 音量斜坡演示：在第 DEMO_VOLUME_ROUND 轮改变 stream/0 的音量。
+        //
+        // **为何由 audiod 自己触发而非外部命令**：计划设想的接口是
+        // `stream/N/volume` 属性，但那是**内核节点**，其内容由内核生成，
+        // 用户态无法写入；要让外部调节生效，需要一个跨进程的"属性写入 ->
+        // 混音器读取"机制（新 syscall 或新节点类型）。那超出本批次范围，
+        // 且属"接口"问题而非"混音"问题。
+        //
+        // 本批次要证明的命题是「音量改变经斜坡平滑过渡、不产生阶跃」——
+        // 那与"谁触发"无关，只要变化真实发生在**运行中的真实链路**上即可。
+        // 故此处自触发一次，并由 intel-hda 的稳态采样观测幅度变化。
+        //
+        // 外部可调接口**未实现**，已在 unittodo9 如实登记为偏离，不声称完成。
+        // **只在"本轮确实混了音频"时推进这个计数器**（M4 修正）。
+        //
+        // 先前用总轮次 `rounds` 触发，但那个计数包含大量**空转**：
+        // 实测 rounds 已到 14144，而音频早在 ~192 轮就放完（live=0）。
+        // 于是音量变更发生在**完全没有音频的时刻**，端到端观测什么也证明不了。
+        // 用一个与音频进度无关的时钟去触发音频事件，是错的。
+        if live_now > 0 {
+            mixed_rounds += 1;
+        }
+        if mixed_rounds == DEMO_VOLUME_ROUND {
+            // 目标 0.5，步长用派生值：完整的 0->1 变化恰好耗时 RAMP_SECONDS；
+            // 从 1.0 到 0.5 是半个行程，故约 2.5ms 完成，步长本身不变。
+            ramps[0].set_target(0.5, audiod::auto_ramp_step());
+            logf(format_args!(
+                "M4: stream/0 volume -> 0.5 (ramping, step={:.6})",
+                audiod::auto_ramp_step()
+            ));
+        }
+
+        // 2g. 周期性如实汇报（数字取自真实计数）。
         //
         // **M3 的 underrun 披露**：计划原文要求 `stream/N/status` 暴露 underrun，
         // 但那是**内核节点**，其内容由内核属性回调生成，读不到用户态计数。
@@ -365,9 +443,24 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
         // 这样"多路欠载可观测"这一**意图**是达成的，只是披露渠道是日志而非
         // 计划指定的那个文件。
         if rounds.is_multiple_of(PROGRESS_EVERY) {
+            // 同时打印**当前各路的音量**与**本轮实际有数据的路数**。
+            //
+            // **为何必须一起打**：M4 的端到端观测要判断某个采样幅度
+            // 是"音量生效"还是"某路本轮无数据"造成的。两者会给出不同的
+            // 预期值，但仅看幅度无法区分。把音量与存活路数与轮次**同时**
+            // 记录，才能把 intel-hda 的采样对回确定的混音条件。
+            //
+            // `live_now` 是本轮实际取到数据的路数（不是累计连接数）——
+            // 它才是决定该轮输出组成的量。
             logf(format_args!(
-                "mixed {} bytes (rounds={} silent={} connected={})",
-                mixed_total, rounds, silent_rounds, state.connected_count()
+                "mixed {} bytes (rounds={} silent={} connected={} live={} vol0={} vol1={})",
+                mixed_total,
+                rounds,
+                silent_rounds,
+                state.connected_count(),
+                live_now,
+                ramps[0].current(),
+                ramps[1].current()
             ));
             // 逐路明细：只列出**有欠载**的路，避免刷屏。
             // 未列出的路欠载为 0，这一点由上面的 connected 汇总结说明。
