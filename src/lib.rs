@@ -791,6 +791,161 @@ impl StereoResampler {
 /// depends on the ratio. Two frames covers the rounding at a block boundary; it is a
 /// bound on the arithmetic, not a tuning knob.
 const RESAMPLE_MARGIN: usize = 2;
+
+/// Which way a path's buffer watermark is moving.
+///
+/// Reporting direction rather than only a number is deliberate: a correction acts on
+/// direction, and a caller that has to interpret a bare float is a caller that can
+/// get the sign wrong.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DriftDirection {
+    /// The buffer level is not moving in one direction beyond the noise floor.
+    Stable,
+    /// The buffer is gaining data over time. Uncorrected, it eventually blocks.
+    Filling,
+    /// The buffer is losing data over time. Uncorrected, it eventually starves.
+    Draining,
+}
+
+/// Number of watermark samples in each comparison window.
+///
+/// The window has to smooth out producer jitter without being so long that a real drift
+/// takes minutes to appear. Producers write in bursts, so the sample-to-sample swing is
+/// large; averaging 128 of them (about 2.7 seconds at one round per 21 ms) brings the
+/// noise well below the drift this is meant to detect.
+const TREND_WINDOW: usize = 128;
+
+/// Drift smaller than this counts as noise rather than movement.
+///
+/// A buffer that shifts by a fraction of a percent over a window has not drifted, it has
+/// jittered. Acting on that would turn normal variation into pitch wobble, which is a
+/// worse artifact than the drift it was trying to fix.
+const DRIFT_EPSILON: f32 = 0.01;
+
+/// Tracks whether a path's buffer watermark is drifting, using two sliding averages.
+///
+/// Instantaneous watermark is useless for this: producers write in bursts, so the level
+/// swings widely round to round while its average stays put. Comparing an average of the
+/// recent past against an average of the less recent past separates the two, and looking
+/// at the *change* rather than the level keeps a steadily-full buffer from being reported
+/// as a problem -- sitting at 90% forever is not a leak.
+///
+/// Sampling every round is intentional. Deciding which rounds are interesting is itself
+/// a judgement that would need its own justification, and the ring buffer already reports
+/// its true occupancy every time.
+pub struct WatermarkTrend {
+    /// Ring of the most recent samples, `TREND_WINDOW * 2` long.
+    samples: alloc::vec::Vec<f32>,
+    /// Index of the next write into `samples`. Full once `filled == samples.len()`.
+    next: usize,
+    /// How many samples have been pushed, saturating at `samples.len()`.
+    filled: usize,
+}
+
+impl WatermarkTrend {
+    /// Create an empty trend tracker with no history.
+    pub fn new() -> Self {
+        Self {
+            samples: alloc::vec![0.0; TREND_WINDOW * 2],
+            next: 0,
+            filled: 0,
+        }
+    }
+
+    /// Record the current watermark, where 0.0 is empty and 1.0 is full.
+    ///
+    /// Values are clamped into `0.0..=1.0` so a caller passing a raw byte count cannot
+    /// silently produce a meaningless average. Out-of-range input is a caller bug, and
+    /// clamping keeps it from corrupting the history that later readings depend on.
+    pub fn push(&mut self, level: f32) {
+        let v = if level.is_nan() {
+            0.0
+        } else {
+            level.clamp(0.0, 1.0)
+        };
+        self.samples[self.next] = v;
+        self.next = (self.next + 1) % self.samples.len();
+        if self.filled < self.samples.len() {
+            self.filled += 1;
+        }
+    }
+
+    /// Mean of the `n` samples ending one window-length before the newest one.
+    ///
+    /// `n` is the age of the newest sample to include: 0 is the newest, so the older
+    /// window is `mean_of_window(TREND_WINDOW)` and the newer one is `mean_of_window(0)`.
+    fn mean_at_age(&self, age: usize) -> Option<f32> {
+        // The window must lie entirely within what has actually been recorded.
+        if self.filled < age + TREND_WINDOW {
+            return None;
+        }
+        let len = self.samples.len();
+        let mut sum = 0.0f32;
+        let mut i = 0usize;
+        while i < TREND_WINDOW {
+            // Walk backwards from the newest sample by `age`, then by `i`.
+            let back = age + i;
+            let idx = (self.next + len - 1 - back) % len;
+            sum += self.samples[idx];
+            i += 1;
+        }
+        Some(sum / TREND_WINDOW as f32)
+    }
+
+    /// Change in average watermark between the older and newer windows.
+    ///
+    /// Positive means the buffer is gaining. Returns 0.0 until both windows are full,
+    /// because a trend computed from partial history would fire during startup -- exactly
+    /// when producers are least steady.
+    pub fn drift(&self) -> f32 {
+        let older = match self.mean_at_age(TREND_WINDOW) {
+            Some(v) => v,
+            None => return 0.0,
+        };
+        let newer = match self.mean_at_age(0) {
+            Some(v) => v,
+            None => return 0.0,
+        };
+        newer - older
+    }
+
+    /// Direction of the drift, with anything under the noise floor reported as stable.
+    pub fn direction(&self) -> DriftDirection {
+        let d = self.drift();
+        if d > DRIFT_EPSILON {
+            DriftDirection::Filling
+        } else if d < -DRIFT_EPSILON {
+            DriftDirection::Draining
+        } else {
+            DriftDirection::Stable
+        }
+    }
+
+    /// Number of samples recorded so far, saturating at a full history.
+    pub fn samples_seen(&self) -> usize {
+        self.filled
+    }
+}
+
+impl DriftDirection {
+    /// Short ASCII name, for logs and `status` output.
+    ///
+    /// A method rather than a `Display` impl: this crate is `no_std` and the string is
+    /// only ever written into a log line, so pulling in formatting machinery would cost
+    /// more than the three match arms.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DriftDirection::Stable => "stable",
+            DriftDirection::Filling => "filling",
+            DriftDirection::Draining => "draining",
+        }
+    }
+}
+impl Default for WatermarkTrend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1786,5 +1941,207 @@ mod tests {
             );
             assert!(n <= expect + 1, "{src}->{dst}: wrote {n}, more than {expect}");
         }
+    }
+
+    /// M6: a steady watermark must report no drift.
+    ///
+    /// This is the control case that keeps the detector honest. A detector that
+    /// reports drift for a constant signal would eventually ask the resampler to trim
+    /// its ratio for no reason, and trimming on noise converts jitter into audible
+    /// pitch wobble. Flat input must give flat output.
+    #[test]
+    fn test_m6_steady_watermark_reports_no_drift() {
+        let mut t = WatermarkTrend::new();
+        let mut i = 0usize;
+        while i < 4096 {
+            t.push(0.5);
+            i += 1;
+        }
+        assert_eq!(t.drift(), 0.0);
+        assert_eq!(t.direction(), DriftDirection::Stable);
+    }
+
+    /// M6: a monotonic rise must be reported as rising, with the right sign.
+    ///
+    /// The point of the trend is direction, not magnitude: knowing whether the buffer
+    /// is filling or draining is what picks which way a correction would go.
+    #[test]
+    fn test_m6_rising_watermark_reports_filling() {
+        let mut t = WatermarkTrend::new();
+        // Climb from 0.1 to 0.9 across the window.
+        let mut i = 0usize;
+        while i < 4096 {
+            t.push(0.1 + 0.8 * (i as f32 / 4095.0));
+            i += 1;
+        }
+        assert!(
+            t.drift() > 0.0,
+            "a rising buffer must report positive drift, got {}",
+            t.drift()
+        );
+        assert_eq!(t.direction(), DriftDirection::Filling);
+    }
+
+    /// M6: a monotonic fall must be reported as draining.
+    #[test]
+    fn test_m6_falling_watermark_reports_draining() {
+        let mut t = WatermarkTrend::new();
+        let mut i = 0usize;
+        while i < 4096 {
+            t.push(0.9 - 0.8 * (i as f32 / 4095.0));
+            i += 1;
+        }
+        assert!(t.drift() < 0.0, "draining must report negative drift, got {}", t.drift());
+        assert_eq!(t.direction(), DriftDirection::Draining);
+    }
+
+    /// M6: jitter around a constant level must NOT be reported as drift.
+    ///
+    /// This is the property the whole component exists for. Real producer write rates
+    /// vary round to round, so the instantaneous watermark swings widely; a detector
+    /// that reacted to that swing would correct against noise. The sliding average must
+    /// absorb it and report stable.
+    #[test]
+    fn test_m6_jitter_around_a_level_is_not_drift() {
+        let mut t = WatermarkTrend::new();
+        // Alternate +/-0.2 around 0.5: a large swing with zero underlying trend.
+        let mut i = 0usize;
+        while i < 4096 {
+            t.push(if i % 2 == 0 { 0.3 } else { 0.7 });
+            i += 1;
+        }
+        assert_eq!(
+            t.direction(),
+            DriftDirection::Stable,
+            "alternating jitter has no trend, but drift was {}",
+            t.drift()
+        );
+    }
+
+    /// M6: a stable-but-biased watermark is NOT drift.
+    ///
+    /// Sitting at 0.9 forever is not a leak; it is a full buffer. Distinguishing level
+    /// from trend is the difference between correcting a real problem and inventing one.
+    #[test]
+    fn test_m6_stable_high_watermark_is_not_drift() {
+        let mut t = WatermarkTrend::new();
+        let mut i = 0usize;
+        while i < 4096 {
+            t.push(0.9);
+            i += 1;
+        }
+        assert_eq!(t.direction(), DriftDirection::Stable);
+    }
+
+    /// M6: fewer samples than a full window must not fabricate a trend.
+    ///
+    /// At startup there is no history to compare against. Reporting drift from a
+    /// near-empty window would correct on the first few rounds, exactly when the
+    /// producers are least steady.
+    #[test]
+    fn test_m6_insufficient_history_reports_stable() {
+        let mut t = WatermarkTrend::new();
+        t.push(0.1);
+        t.push(0.9);
+        assert_eq!(
+            t.direction(),
+            DriftDirection::Stable,
+            "two samples are not a trend"
+        );
+        assert_eq!(t.drift(), 0.0);
+    }
+
+    /// M6: the sliding average must genuinely average -- phase-aligned jitter is not enough.
+    ///
+    /// `test_m6_jitter_around_a_level_is_not_drift` uses an even-period alternation, and
+    /// the two windows are an even number of samples apart, so sampling a single point
+    /// from each window lands on the SAME phase and also reports stability. That test
+    /// therefore passes whether or not any averaging happens.
+    ///
+    /// This one closes that hole: both halves average to exactly the same value, but the
+    /// amplitude differs, so no single-point comparison can see them as equal. Only a
+    /// real average reports Stable.
+    #[test]
+    fn test_m6_average_is_what_absorbs_amplitude_change() {
+        let mut t = WatermarkTrend::new();
+        let mut i = 0usize;
+        // Older half: wide swing around 0.5. Newer half: narrow swing around 0.5.
+        // Both average to 0.5 exactly, so the trend is zero -- but any given sample
+        // differs between the halves.
+        while i < TREND_WINDOW {
+            t.push(if i % 2 == 0 { 0.1 } else { 0.9 });
+            i += 1;
+        }
+        while i < TREND_WINDOW * 2 {
+            t.push(if i % 2 == 0 { 0.45 } else { 0.55 });
+            i += 1;
+        }
+        assert_eq!(
+            t.direction(),
+            DriftDirection::Stable,
+            "both halves average to 0.5, so there is no drift, but drift was {}",
+            t.drift()
+        );
+    }
+
+    /// M6: out-of-range and NaN watermarks must not corrupt the history.
+    ///
+    /// The caller computes the level as a ratio; a zero capacity would produce infinity
+    /// or NaN, and one such value entering the ring would poison every later average that
+    /// includes it -- turning a division edge case into a permanent phantom trend.
+    #[test]
+    fn test_m6_adversarial_watermarks_do_not_corrupt_history() {
+        let mut t = WatermarkTrend::new();
+        // A burst of nonsense, then a clean steady level.
+        t.push(f32::NAN);
+        t.push(f32::INFINITY);
+        t.push(f32::NEG_INFINITY);
+        t.push(-5.0);
+        t.push(99.0);
+        // Fill well past the window so the garbage is entirely aged out.
+        let mut i = 0usize;
+        while i < TREND_WINDOW * 3 {
+            t.push(0.5);
+            i += 1;
+        }
+        assert_eq!(
+            t.direction(),
+            DriftDirection::Stable,
+            "garbage input must not leave a phantom trend, got {}",
+            t.drift()
+        );
+        // The clamped values must also stay inside the documented range, so a later
+        // consumer reading `drift()` never sees a magnitude larger than the whole range.
+        assert!(t.drift().abs() <= 1.0, "drift {} out of range", t.drift());
+    }
+
+    /// M6: a single out-of-range sample inside the window must be clamped, not averaged raw.
+    ///
+    /// The previous adversarial test pushed garbage and then enough clean samples to age it
+    /// out entirely, so it passed with or without clamping -- it never observed a clamped
+    /// value. Here one 99.0 sits INSIDE the newer window, and the assertion is on the exact
+    /// arithmetic: clamped to 1.0 it contributes `1.0 / 128`, raw it contributes `99.0 / 128`.
+    /// The two differ by 78x, so there is no borderline judgement involved.
+    #[test]
+    fn test_m6_out_of_range_sample_is_clamped_in_the_average() {
+        let mut t = WatermarkTrend::new();
+        // Older window: all zero. Newer window: all zero except one absurd sample.
+        let mut i = 0usize;
+        while i < TREND_WINDOW {
+            t.push(0.0);
+            i += 1;
+        }
+        while i < TREND_WINDOW * 2 - 1 {
+            t.push(0.0);
+            i += 1;
+        }
+        t.push(99.0);
+        // Clamped: drift == 1.0 / 128 == 0.0078125. Raw: drift == 99.0 / 128 == 0.773.
+        let d = t.drift();
+        assert!(
+            d < 0.01,
+            "an out-of-range level must be clamped to 1.0 before averaging; drift was {d}"
+        );
+        assert!(d > 0.0, "the clamped sample must still be counted, drift was {d}");
     }
 }

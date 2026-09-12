@@ -52,6 +52,12 @@ const MIX_INPUTS: usize = 4;
 /// 与 `dsp` 的 64 KiB ring 相比足够小，使单次写通常放得下（背压罕见）。
 const MIX_READ_BYTES: usize = 4096;
 
+/// 一轮最多能读到的帧数。M6 用它把"本轮读到多少帧"归一化到 0..1。
+///
+/// 由 `MIX_READ_BYTES` **推导**而非另写一个数字：两者必须一致，
+/// 否则归一化出来的"水位"与实际读取能力脱节（S15 单点定义）。
+const MAX_FRAMES_PER_ROUND: usize = MIX_READ_BYTES / FRAME_BYTES;
+
 /// 一个 PCM 帧的字节数（s16 立体声：2 声道 x 2 字节）。
 ///
 /// 该值是**格式契约**的一部分，与 dsp 属性文件报告的 format 对应；
@@ -367,6 +373,10 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
     // 故用运行时循环填数组，而不是 `[const { ... }; N]`。
     let mut ramps: [audiod::Ramp; MIX_INPUTS] = core::array::from_fn(|_| audiod::Ramp::new(1.0));
 
+    // M6：每路的供数趋势观测器（第一版**只观测不调节**，见文件头说明）。
+    let mut trends: [audiod::WatermarkTrend; MIX_INPUTS] =
+        core::array::from_fn(|_| audiod::WatermarkTrend::new());
+
     let mut raw: [[u8; MIX_READ_BYTES]; MIX_INPUTS] = [[0u8; MIX_READ_BYTES]; MIX_INPUTS];
     let mut chans: [alloc::vec::Vec<f32>; MIX_INPUTS] =
         [const { alloc::vec::Vec::new() }; MIX_INPUTS];
@@ -404,6 +414,10 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
         let mut k = 0usize;
         while k < MIX_INPUTS {
             chans[k].clear();
+            // M6：本轮从该路成功读到的帧数。**先置 0**，只有真正读到才赋值。
+            // 它在 match 之外被趋势读取，所以"没读到"必须表现为 0 而不是跳过采样
+            // —— 跳过采样会让趋势冻结（见下方 push 处的说明）。
+            let mut src_frames_this_round = 0usize;
             if let Some(inp) = inputs[k].as_mut() {
                 match read(inp.fd, &mut raw[k]) {
                     // 读到字节：转 f32。仅取 FRAME_BYTES 的整数倍，余数留到下一轮
@@ -417,6 +431,7 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
                         state.set_connected(k, true);
                         state.note_data(k);
                         let src_frames = n / FRAME_BYTES;
+                        src_frames_this_round = src_frames;
                         if src_frames > 0 {
                             // chans[k] 本轮的产出帧数由重采样决定；音量在
                             // 重采样**之后**逐样本施加（见 convert_and_resample）。
@@ -451,6 +466,24 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
                     }
                 }
             }
+            // M6：把本轮的供数率归一化后记入趋势。
+            //
+            // **必须在 match 之外、每轮无条件执行**。初版把它写在读到数据的分支里，
+            // 结果是该路一旦停止供数就**再也不采样**，历史被冻结在最后一次良好的
+            // 读数上，新旧窗口的均值恒等 -> drift 恒为 0。
+            // 实测：一路写满后退出（live 由 2 变 1）却一条 drift 都没报。
+            // 那正是最该报警的场景，而检测器对它是**结构性失明**的。
+            //
+            // 由此还推出一条一般性教训："没有观测到异常"与"观测不到异常"在输出上
+            // 完全一样，只有当检测器被证明能对异常报警时，前者才是有效结论。
+            //
+            // 为何用**供数率**而不是内核 ring 的水位：audiod 在用户态，看不到
+            // stream ring 的占用。但水位的变化率恰是 `供数率 - 消耗率`，而消耗率
+            // 对所有路相同（每轮上限固定），故供数率相对满速的偏移与水位趋势
+            // 是同一个信息。这是**代理量**，不是计划字面上的内核水位，如实登记。
+            //
+            // 归一化到 0..1 使不同路可比较，漂移阈值也才有一致含义。
+            trends[k].push(src_frames_this_round as f32 / MAX_FRAMES_PER_ROUND as f32);
             k += 1;
         }
 
@@ -628,6 +661,29 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
                 ramps[0].current(),
                 ramps[1].current()
             ));
+            // M6：逐路报告供数趋势。
+            //
+            // **第一版只观测不调节**（计划 §9.4 第 1 级）。理由：在拿到实测数据
+            // 之前就写自适应控制律，等于凭空发明一个控制器 —— 若真实系统只有
+            // 抖动而无漂移，调节反而把抖动变成可闻的音调摆动，比不调节更糟。
+            // 故先如实披露，用数据回答"要不要调、往哪调、调多少"。
+            //
+            // 只列出**非 stable** 的路：stable 是常态，全列会淹没有意义的信息；
+            // 未列出的路趋势即为 stable，这一点由上面一行说明。
+            let mut k = 0usize;
+            while k < MIX_INPUTS {
+                let dir = trends[k].direction();
+                if dir != audiod::DriftDirection::Stable {
+                    logf(format_args!(
+                        "  stream/{}: drift={} (delta={:.6}, samples={})",
+                        k,
+                        dir.as_str(),
+                        trends[k].drift(),
+                        trends[k].samples_seen()
+                    ));
+                }
+                k += 1;
+            }
             // 逐路明细：只列出**有欠载**的路，避免刷屏。
             // 未列出的路欠载为 0，这一点由上面的 connected 汇总结说明。
             let mut k = 0usize;
