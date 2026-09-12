@@ -835,6 +835,17 @@ const DRIFT_EPSILON: f32 = 0.01;
 /// its true occupancy every time.
 pub struct WatermarkTrend {
     /// Ring of the most recent samples, `TREND_WINDOW * 2` long.
+    ///
+    /// The length is exactly the two windows the comparison needs, and no more. A longer
+    /// ring would not add information -- `drift` only ever looks back one window -- but it
+    /// would delay how quickly a change clears: with exactly two windows, a step change is
+    /// fully reflected after one window, whereas a three-window ring would keep the old
+    /// regime in history for an extra window and dilute the reading.
+    ///
+    /// Writing this test the other way round is instructive: an early version pushed three
+    /// windows and then asserted the detector still saw the shift, but the first window had
+    /// already been overwritten, so the detector was correctly comparing two all-zero
+    /// windows. The test was wrong, not the code.
     samples: alloc::vec::Vec<f32>,
     /// Index of the next write into `samples`. Full once `filled == samples.len()`.
     next: usize,
@@ -2143,5 +2154,64 @@ mod tests {
             "an out-of-range level must be clamped to 1.0 before averaging; drift was {d}"
         );
         assert!(d > 0.0, "the clamped sample must still be counted, drift was {d}");
+    }
+
+    /// M6: two paths must have independent trends -- one drifting must not move the other.
+    ///
+    /// The injection experiment showed stream/1 reporting while stream/0 stayed silent, and
+    /// that is the end-to-end evidence. This pins the same property at the component level
+    /// so a future refactor that shares state between paths fails here rather than only in
+    /// a 30-minute QEMU run.
+    #[test]
+    fn test_m6_two_paths_track_independently() {
+        let mut healthy = WatermarkTrend::new();
+        let mut starving = WatermarkTrend::new();
+        // Exactly two windows: one full window of supply, then one of nothing. Pushing a
+        // third window would overwrite the first, leaving the detector comparing two
+        // all-zero windows and correctly reporting Stable -- which is what the first
+        // version of this test did, and the failure was the test being wrong, not the code.
+        let mut i = 0usize;
+        while i < TREND_WINDOW * 2 {
+            // One path keeps supplying at full rate; the other stops after the first window.
+            healthy.push(1.0);
+            starving.push(if i < TREND_WINDOW { 1.0 } else { 0.0 });
+            i += 1;
+        }
+        assert_eq!(
+            healthy.direction(),
+            DriftDirection::Stable,
+            "the healthy path must not be affected by the other path"
+        );
+        assert_eq!(
+            starving.direction(),
+            DriftDirection::Draining,
+            "the stalled path must be reported as draining"
+        );
+    }
+
+
+    /// M6: the history must be exactly the two windows the comparison needs, no longer.
+    ///
+    /// A longer ring does not change any single reading -- `drift` only ever looks back one
+    /// window -- so this is invisible to every other test, and mutation testing found it:
+    /// quadrupling the ring kept the whole suite green. What the length actually controls is
+    /// how long stale history lingers, which is observable only through the retained-sample
+    /// count. Pinning it here keeps `samples_seen` honest and stops a future change from
+    /// quietly diluting how quickly a shift is reflected.
+    #[test]
+    fn test_m6_history_is_exactly_two_windows() {
+        let mut t = WatermarkTrend::new();
+        assert_eq!(t.samples_seen(), 0, "a fresh tracker has no history");
+        let mut i = 0usize;
+        // Push more than any plausible ring could hold, then check the saturated count.
+        while i < TREND_WINDOW * 8 {
+            t.push(0.5);
+            i += 1;
+        }
+        assert_eq!(
+            t.samples_seen(),
+            TREND_WINDOW * 2,
+            "the ring must retain exactly the two windows the comparison spans"
+        );
     }
 }
