@@ -68,21 +68,6 @@ const FRAME_BYTES: usize = 4;
 /// 这里只做别名，避免同一个事实有两处定义（S15）。
 const FORMAT_CHANNELS: usize = audiod::FORMAT_CHANNELS;
 
-/// Frames of silence emitted for a round in which no input produced data.
-///
-/// Matches one round of normal intake (MIX_READ_BYTES / FRAME_BYTES = 1024 frames,
-/// about 21ms at 48kHz). The output timeline stays continuous, so producing paths
-/// that resume later are not shifted in time. Emitting silence is not fabricating
-/// data: it states accurately that no audio existed for this interval.
-const SILENCE_ROUND_FRAMES: usize = MIX_READ_BYTES / FRAME_BYTES;
-
-/// Rounds of total silence tolerated before an idle mixer stops writing to dsp.
-///
-/// With no connected producer there is nothing to keep the DMA fed; continuing to
-/// push silence forever would busy-spin. A short grace period still covers the
-/// startup transient before producers connect. The mixer never exits -- a producer
-/// may attach at any time.
-const SILENCE_GRACE_ROUNDS: u64 = 64;
 
 /// Mixed-audio round at which the M4 demonstration changes stream/0 volume.
 ///
@@ -403,8 +388,6 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
     let mut resample_out: [alloc::vec::Vec<f32>; MIX_INPUTS] =
         [const { alloc::vec::Vec::new() }; MIX_INPUTS];
     let mut out_bytes = alloc::vec::Vec::new();
-    // 复用的静音缓冲（避免每轮重新分配；长度在首次使用时确定）。
-    let mut silent_buf: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     // 真正混过音频的轮次（区别于总轮次，后者含大量空转）。M4 用它触发音量变更。
     let mut mixed_rounds: u64 = 0;
     let mut mixed_total: u64 = 0;
@@ -493,60 +476,21 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
             k += 1;
         }
 
-        // 2b. 全部输入都无数据时如何处理（M3 修正）。
+        // 2b. 全部输入都无连接时如何处理（B7 修正：**不再主动写静音**）。
         //
-        // **先前实现直接 `continue`（完全不写 dsp），那是错的**：
-        // dsp 的 ring 是有限的，停写会让驱动侧 DMA 立刻跑空 ——
-        // 那才是真正的"欠载"，而且会把"某路暂时没数据"放大成"整机静默"。
+        // **旧实现（M3）写等长静音保时间轴，与直写 dsp 的生产者互踩**：
+        // audiofile 直写 dsp（不经 stream/N），audiod 看不到它，connected_count()
+        // 恒为 0，于是每轮无条件往 ring 灌静音。两个生产者交替挤占同一个
+        // 64KiB ring，实测三重听感损害：音乐被静音块穿插（卡顿）、块边界
+        // 爆音（电流音）、欠载回卷重播旧块（重影/两遍）。
         //
-        // 正确做法：**写一段等长静音**，保持输出时钟连续。
-        // 这样做的意义不只是"听起来没断"，更是**时间正确性**：
-        // 输出流的时间轴必须连续，否则一旦重新有数据，音画/节拍会漂移。
-        //
-        // 静音长度取本轮**本该**产出的帧数。因为各路都没数据，无可依据，
-        // 故用固定的 SILENCE_ROUND_FRAMES（与一轮的常规读取量对应）。
-        // 这不是编造数据：它如实表示"这段时间没有音频"。
-        if state.connected_count() == 0 && silent_rounds > SILENCE_GRACE_ROUNDS {
-            // 一台完全没有连接任何生产者的混音器不该无限空转刷日志，
-            // 但也**不能退出**：生产者随时可能接入。故降频空转。
-            silent_rounds += 1;
-            let _ = yield_now();
-            continue;
-        }
-
-        // 2b. **全部输入都空**时，输出一段静音，而不是跳过。
-        //
-        // 这保证 dsp 不断流（ring 有限，停写会让 DMA 跑空），
-        // 更重要的是保证**输出时间轴连续**：若此时直接跳过，等数据恢复时
-        // 声音会相对真实时间提前，长时间运行即产生可闻漂移。
-        //
-        // 静音是真实信息（"这段时间没有音频"），不是伪造数据。
+        // **欠载静音的职责已由 intel-hda 承担**（fill_chunk_from_ring 对
+        // `got < want` 补零续播，DMA 不停），此处的静音写入是重复职责且
+        // 唯一效果是与真实生产者抢空间——故删除。全无输入时降频空转：
+        // 不占 ring，read 本就非阻塞，生产者随时接入都能被立即读到。
         if state.connected_count() == 0 {
             silent_rounds += 1;
-            // 静音帧数 = 一轮常规读取量，使时间轴与正常轮次等长。
-            silent_buf.clear();
-            silent_buf.resize(SILENCE_ROUND_FRAMES * FRAME_BYTES, 0u8);
-            let mut off = 0usize;
-            while off < silent_buf.len() {
-                match write(dfd, &silent_buf[off..]) {
-                    Ok(w) if w > 0 => {
-                        off += w;
-                        mixed_total += w as u64;
-                    }
-                    // dsp 满或写 0：让出后重试，绝不丢弃（时间轴必须完整）。
-                    Ok(_) => {
-                        let _ = yield_now();
-                    }
-                    // 合并（guard 冗余）：同样是"写不下/写 0 字节 -> 让出后重试"。
-                    Err(Error::WouldBlock) => {
-                        let _ = yield_now();
-                    }
-                    Err(e) => {
-                        logf(format_args!("FAIL: write({}) during silence: {:?}", DSP_PATH, e));
-                        return 1;
-                    }
-                }
-            }
+            let _ = yield_now();
             continue;
         }
 
